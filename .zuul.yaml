@@ -1,22 +1,84 @@
 - job:
     name: cloudkitty-tempest-full
-    run: playbooks/cloudkitty-tempest-full/run.yaml
-    post-run: playbooks/cloudkitty-tempest-full/post.yaml
-    timeout: 5400
-    parent: legacy-dsvm-base
+    parent: devstack-tempest
+    description: |
+      Job testing cloudkitty installation on devstack and running tempest tests
     required-projects:
-      - openstack-infra/devstack-gate
-      - openstack/cloudkitty
-      - openstack/cloudkitty-tempest-plugin
-      - openstack/python-cloudkittyclient
+      - name: openstack/cloudkitty
+      - name: openstack/cloudkitty-tempest-plugin
+      - name: openstack/python-cloudkittyclient
+    roles:
+      - zuul: openstack-infra/devstack
+    timeout: 5400
+    irrelevant-files:
+      - ^.*\.rst$
+      - ^doc/.*$
+      - ^releasenotes/.*$
+    vars:
+      devstack_plugins:
+        cloudkitty: https://opendev.org/openstack/cloudkitty
+        cloudkitty-tempest-plugin: https://opendev.org/openstack/cloudkitty-tempest-plugin
+      devstack_services:
+        ck-api: true
+        ck-proc: true
+        horizon: false
+        tempest: true
+      tempest_concurrency: 1
+      tempest_test_regex: cloudkitty_tempest_plugin.*
+      tox_envlist: all
+      devstack_localrc:
+        CLOUDKITTY_FETCHER: keystone
+        TEMPEST_PLUGINS: /opt/stack/cloudkitty-tempest-plugin
+
+- job:
+    name: cloudkitty-tempest-full-python3
+    parent: cloudkitty-tempest-full
+    description: |
+      Job testing cloudkitty installation on devstack with python 3 and running
+    vars:
+      devstack_localrc:
+        DEVSTACK_GATE_USE_PYTHON3: "True"
+        USE_PYTHON3: "True"
+
+- job:
+    name: cloudkitty-tox-bandit
+    parent: openstack-tox
+    timeout: 2400
+    vars:
+      tox_envlist: bandit
+    required-projects:
+      - openstack/requirements
+    irrelevant-files:
+      - ^.*\.rst$
+      - ^.*\.txt$
+      - ^api-ref/.*$
+      - ^apidocs/.*$
+      - ^contrib/.*$
+      - ^doc/.*$
+      - ^etc/.*$
+      - ^releasenotes/.*$
+      - ^setup.cfg$
+      - ^tools/.*$
+      - ^cloudkitty/hacking/.*$
+      - ^cloudkitty/tests/scenario/.*$
+      - ^cloudkitty/tests/unittests/.*$
 
 - project:
-    name: openstack/cloudkitty
+    templates:
+      - check-requirements
+      - openstack-cover-jobs
+      - openstack-python-jobs
+      - openstack-python3-train-jobs
+      - publish-openstack-docs-pti
+      - release-notes-jobs-python3
     check:
       jobs:
-        - cloudkitty-tempest-full:
+        - cloudkitty-tempest-full
+        - cloudkitty-tempest-full-python3
+        - cloudkitty-tox-bandit:
             voting: false
     gate:
+      queue: cloudkitty
       jobs:
-        - cloudkitty-tempest-full:
-            voting: false
+        - cloudkitty-tempest-full
+        - cloudkitty-tempest-full-python3

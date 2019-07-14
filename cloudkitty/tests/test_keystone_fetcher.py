@@ -20,7 +20,7 @@ import unittest
 import mock
 from oslo_utils import uuidutils
 
-from cloudkitty.tenant_fetcher import keystone
+from cloudkitty.fetcher import keystone
 from cloudkitty import tests
 
 
@@ -71,11 +71,11 @@ class KeystoneFetcherTest(tests.TestCase):
     def setUp(self):
         super(KeystoneFetcherTest, self).setUp()
         self.conf.set_override('backend', 'keystone', 'tenant_fetcher')
-        self.conf.import_group('keystone_fetcher',
-                               'cloudkitty.tenant_fetcher.keystone')
+        self.conf.import_group('fetcher_keystone',
+                               'cloudkitty.fetcher.keystone')
 
     @unittest.SkipTest
-    def test_keystone_tenant_fetcher_filter_list(self):
+    def test_fetcher_keystone_filter_list(self):
         kclient = 'keystoneclient.client.Client'
         with mock.patch(kclient) as kclientmock:
             kclientmock.return_value = Client()

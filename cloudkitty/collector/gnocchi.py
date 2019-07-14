@@ -13,13 +13,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-import decimal
+import six
 
+from gnocchiclient import auth as gauth
 from gnocchiclient import client as gclient
+from gnocchiclient import exceptions as gexceptions
 from keystoneauth1 import loading as ks_loading
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import units
+from voluptuous import All
+from voluptuous import In
+from voluptuous import Length
+from voluptuous import Required
+from voluptuous import Schema
 
 from cloudkitty import collector
 from cloudkitty import utils as ck_utils
@@ -27,96 +33,146 @@ from cloudkitty import utils as ck_utils
 
 LOG = logging.getLogger(__name__)
 
-GNOCCHI_COLLECTOR_OPTS = 'gnocchi_collector'
-gnocchi_collector_opts = ks_loading.get_auth_common_conf_options()
+# NOTE(mc): The deprecated section should be removed in a future release.
+COLLECTOR_GNOCCHI_OPTS = 'collector_gnocchi'
+DEPRECATED_COLLECTOR_GNOCCHI_OPTS = 'gnocchi_collector'
 
-cfg.CONF.register_opts(gnocchi_collector_opts, GNOCCHI_COLLECTOR_OPTS)
-ks_loading.register_session_conf_options(
-    cfg.CONF,
-    GNOCCHI_COLLECTOR_OPTS)
-ks_loading.register_auth_conf_options(
-    cfg.CONF,
-    GNOCCHI_COLLECTOR_OPTS)
+keystone_opts = ks_loading.get_auth_common_conf_options() + \
+    ks_loading.get_session_conf_options()
+
+keystone_opts = [
+    cfg.Opt(
+        o.name,
+        type=o.type,
+        help=o.help,
+        deprecated_group=DEPRECATED_COLLECTOR_GNOCCHI_OPTS,
+    ) for o in keystone_opts
+]
+
+collector_gnocchi_opts = [
+    cfg.StrOpt(
+        'gnocchi_auth_type',
+        default='keystone',
+        choices=['keystone', 'basic'],
+        help='Gnocchi auth type (keystone or basic). Keystone credentials '
+        'can be specified through the "auth_section" parameter',
+        deprecated_group=DEPRECATED_COLLECTOR_GNOCCHI_OPTS,
+    ),
+    cfg.StrOpt(
+        'gnocchi_user',
+        default='',
+        help='Gnocchi user (for basic auth only)',
+        deprecated_group=DEPRECATED_COLLECTOR_GNOCCHI_OPTS,
+    ),
+    cfg.StrOpt(
+        'gnocchi_endpoint',
+        default='',
+        help='Gnocchi endpoint (for basic auth only)',
+        deprecated_group=DEPRECATED_COLLECTOR_GNOCCHI_OPTS,
+    ),
+    cfg.StrOpt(
+        'interface',
+        default='internalURL',
+        help='Endpoint URL type (for keystone auth only)',
+        deprecated_group=DEPRECATED_COLLECTOR_GNOCCHI_OPTS,
+    ),
+    cfg.StrOpt(
+        'region_name',
+        default='RegionOne',
+        help='Region Name',
+        deprecated_group=DEPRECATED_COLLECTOR_GNOCCHI_OPTS,
+    ),
+]
+
+cfg.CONF.register_opts(keystone_opts, COLLECTOR_GNOCCHI_OPTS)
+cfg.CONF.register_opts(collector_gnocchi_opts, COLLECTOR_GNOCCHI_OPTS)
+
 CONF = cfg.CONF
 
-METRICS_CONF = ck_utils.get_metrics_conf(CONF.collect.metrics_conf)
+GNOCCHI_EXTRA_SCHEMA = {
+    Required('extra_args'): {
+        Required('resource_type'): All(str, Length(min=1)),
+        # Due to Gnocchi model, metric are grouped by resource.
+        # This parameter permits to adapt the key of the resource identifier
+        Required('resource_key', default='id'): All(str, Length(min=1)),
+        Required('aggregation_method', default='max'):
+            In(['max', 'mean', 'min', 'rate:max', 'rate:mean', 'rate:min']),
+    },
+}
+
+
+class AssociatedResourceNotFound(Exception):
+    """Exception raised when no resource can be associated with a metric."""
+
+    def __init__(self, resource_key, resource_id):
+        super(AssociatedResourceNotFound, self).__init__(
+            'Resource with {}={} could not be found'.format(
+                resource_key, resource_id),
+        )
 
 
 class GnocchiCollector(collector.BaseCollector):
+
     collector_name = 'gnocchi'
-    dependencies = ('GnocchiTransformer',
-                    'CloudKittyFormatTransformer')
-    retrieve_mappings = {
-        'compute': 'instance',
-        'image': 'image',
-        'volume': 'volume',
-        'network.bw.out': 'instance_network_interface',
-        'network.bw.in': 'instance_network_interface',
-        'network.floating': 'network',
-    }
-    metrics_mappings = {
-        'compute': [
-            ('vcpus', 'max'),
-            ('memory', 'max'),
-            ('cpu', 'max'),
-            ('disk.root.size', 'max'),
-            ('disk.ephemeral.size', 'max')],
-        'image': [
-            ('image.size', 'max'),
-            ('image.download', 'max'),
-            ('image.serve', 'max')],
-        'volume': [
-            ('volume.size', 'max')],
-        'network.bw.out': [
-            ('network.outgoing.bytes', 'max')],
-        'network.bw.in': [
-            ('network.incoming.bytes', 'max')],
-        'network.floating': [
-            ('ip.floating', 'max')],
-    }
-    units_mappings = {
-        'compute': (1, 'instance'),
-        'image': ('image.size', 'MB'),
-        'volume': ('volume.size', 'GB'),
-        'network.bw.out': ('network.outgoing.bytes', 'MB'),
-        'network.bw.in': ('network.incoming.bytes', 'MB'),
-        'network.floating': (1, 'ip'),
-    }
-    default_unit = (1, 'unknown')
 
     def __init__(self, transformers, **kwargs):
         super(GnocchiCollector, self).__init__(transformers, **kwargs)
 
-        self.t_gnocchi = self.transformers['GnocchiTransformer']
-        self.t_cloudkitty = self.transformers['CloudKittyFormatTransformer']
+        adapter_options = {'connect_retries': 3}
+        if CONF.collector_gnocchi.gnocchi_auth_type == 'keystone':
+            auth_plugin = ks_loading.load_auth_from_conf_options(
+                CONF,
+                COLLECTOR_GNOCCHI_OPTS,
+            )
+            adapter_options['interface'] = CONF.collector_gnocchi.interface
+        else:
+            auth_plugin = gauth.GnocchiBasicPlugin(
+                user=CONF.collector_gnocchi.gnocchi_user,
+                endpoint=CONF.collector_gnocchi.gnocchi_endpoint,
+            )
+        adapter_options['region_name'] = CONF.collector_gnocchi.region_name
 
-        self.auth = ks_loading.load_auth_from_conf_options(
-            CONF,
-            GNOCCHI_COLLECTOR_OPTS)
-        self.session = ks_loading.load_session_from_conf_options(
-            CONF,
-            GNOCCHI_COLLECTOR_OPTS,
-            auth=self.auth)
+        verify = True
+        if CONF.collector_gnocchi.cafile:
+            verify = CONF.collector_gnocchi.cafile
+        elif CONF.collector_gnocchi.insecure:
+            verify = False
+
         self._conn = gclient.Client(
             '1',
-            session=self.session)
+            session_options={'auth': auth_plugin, 'verify': verify},
+            adapter_options=adapter_options,
+        )
+
+    @staticmethod
+    def check_configuration(conf):
+        """Check metrics configuration
+
+        """
+        conf = collector.BaseCollector.check_configuration(conf)
+        metric_schema = Schema(collector.METRIC_BASE_SCHEMA).extend(
+            GNOCCHI_EXTRA_SCHEMA)
+
+        output = {}
+        for metric_name, metric in conf.items():
+            met = output[metric_name] = metric_schema(metric)
+
+            if met['extra_args']['resource_key'] not in met['groupby']:
+                met['groupby'].append(met['extra_args']['resource_key'])
+
+        return output
 
     @classmethod
-    def get_metadata(cls, resource_name, transformers):
+    def get_metadata(cls, resource_name, transformers, conf):
         info = super(GnocchiCollector, cls).get_metadata(resource_name,
                                                          transformers)
         try:
-            info["metadata"].extend(transformers['GnocchiTransformer']
-                                    .get_metadata(resource_name))
-
-            try:
-                info["unit"] = METRICS_CONF['services_units'][resource_name][1]
-            # NOTE(mc): deprecated except part kept for backward compatibility.
-            except KeyError:
-                LOG.warning('Error when trying to use yaml metrology conf.')
-                LOG.warning('Fallback on the deprecated oslo config method.')
-                info["unit"] = cls.units_mappings[resource_name][1]
-
+            info["metadata"].extend(
+                conf[resource_name]['groupby']
+            ).extend(
+                conf[resource_name]['metadata']
+            )
+            info['unit'] = conf[resource_name]['unit']
         except KeyError:
             pass
         return info
@@ -169,56 +225,59 @@ class GnocchiCollector(collector.BaseCollector):
             self.gen_filter(cop="<=", started_at=end))
         return time_filter
 
-    def _expand(self, metrics, resource, name, aggregate, start, end):
-        try:
-            values = self._conn.metric.get_measures(
-                metric=metrics[name],
-                start=ck_utils.ts2dt(start),
-                stop=ck_utils.ts2dt(end),
-                aggregation=aggregate)
-            # NOTE(sheeprine): Get the list of values for the current
-            # metric and get the first result value.
-            # [point_date, granularity, value]
-            # ["2015-11-24T00:00:00+00:00", 86400.0, 64.0]
-            resource[name] = values[0][2]
-        except IndexError:
-            resource[name] = 0
-        except KeyError:
-            # Skip metrics not found
-            pass
-
-    def _expand_metrics(self, resources, mappings, start, end):
-        for resource in resources:
-            metrics = resource.get('metrics', {})
-            try:
-                for mapping in mappings:
-                    self._expand(
-                        metrics,
-                        resource,
-                        mapping.keys()[0],
-                        mapping.values()[0],
-                        start,
-                        end,
-                    )
-            # NOTE(mc): deprecated except part kept for backward compatibility.
-            except AttributeError:
-                LOG.warning('Error when trying to use yaml metrology conf.')
-                LOG.warning('Fallback on the deprecated oslo config method.')
-                for name, aggregate in mappings:
-                    self._expand(
-                        metrics,
-                        resource,
-                        name,
-                        aggregate,
-                        start,
-                        end,
-                    )
-
-    def get_resources(self, resource_name, start, end,
-                      project_id, q_filter=None):
+    def _fetch_resources(self, metric_name, start, end,
+                         project_id=None, q_filter=None):
         """Get resources during the timeframe.
 
-        :param resource_name: Resource name to filter on.
+        :type metric_name: str
+        :param start: Start of the timeframe.
+        :param end: End of the timeframe if needed.
+        :param project_id: Filter on a specific tenant/project.
+        :type project_id: str
+        :param q_filter: Append a custom filter.
+        :type q_filter: list
+        """
+
+        # Get gnocchi specific conf
+        extra_args = self.conf[metric_name]['extra_args']
+        resource_type = extra_args['resource_type']
+        scope_key = CONF.collect.scope_key
+
+        # Build query
+
+        # FIXME(peschk_l): In order not to miss any resource whose metrics may
+        # contain measures after its destruction, we scan resources over three
+        # collect periods.
+        start -= CONF.collect.period
+        end += CONF.collect.period
+        query_parameters = self._generate_time_filter(start, end)
+
+        if project_id:
+            kwargs = {scope_key: project_id}
+            query_parameters.append(self.gen_filter(**kwargs))
+        if q_filter:
+            query_parameters.append(q_filter)
+
+        sorts = [extra_args['resource_key'] + ':asc']
+        resources = []
+        marker = None
+        while True:
+            resources_chunk = self._conn.resource.search(
+                resource_type=resource_type,
+                query=self.extend_filter(*query_parameters),
+                sorts=sorts,
+                marker=marker)
+            if len(resources_chunk) < 1:
+                break
+            resources += resources_chunk
+            marker = resources_chunk[-1][extra_args['resource_key']]
+        return {res[extra_args['resource_key']]: res for res in resources}
+
+    def _fetch_metric(self, metric_name, start, end,
+                      project_id=None, q_filter=None):
+        """Get metric during the timeframe.
+
+        :param metric_name: metric name to filter on.
         :type resource_name: str
         :param start: Start of the timeframe.
         :param end: End of the timeframe if needed.
@@ -227,85 +286,119 @@ class GnocchiCollector(collector.BaseCollector):
         :param q_filter: Append a custom filter.
         :type q_filter: list
         """
-        # NOTE(sheeprine): We first get the list of every resource running
-        # without any details or history.
-        # Then we get information about the resource getting details and
-        # history.
 
-        # Translating the resource name if needed
-        query_parameters = self._generate_time_filter(start, end)
+        # Get gnocchi specific conf
+        extra_args = self.conf[metric_name]['extra_args']
 
-        try:
-            resource_type = METRICS_CONF['services_objects'].get(resource_name)
-        # NOTE(mc): deprecated except part kept for backward compatibility.
-        except KeyError:
-            LOG.warning('Error when trying to use yaml metrology conf.')
-            LOG.warning('Fallback on the deprecated oslo config method.')
-            resource_type = self.retrieve_mappings.get(resource_name)
+        # get ressource type
+        resource_type = extra_args['resource_type']
+        scope_key = CONF.collect.scope_key
 
+        # build search query using ressource type and project_id if provided
+        query_parameters = list()
         query_parameters.append(
             self.gen_filter(cop="=", type=resource_type))
-        query_parameters.append(
-            self.gen_filter(project_id=project_id))
+
+        if project_id:
+            kwargs = {scope_key: project_id}
+            query_parameters.append(self.gen_filter(**kwargs))
         if q_filter:
             query_parameters.append(q_filter)
-        resources = self._conn.resource.search(
-            resource_type=resource_type,
-            query=self.extend_filter(*query_parameters))
-        return resources
 
-    def resource_info(self, resource_name, start, end, project_id,
-                      q_filter=None):
+        # build aggregration operation
+        op = ["aggregate", extra_args['aggregation_method'],
+              ["metric", metric_name, extra_args['aggregation_method']]]
+
+        # get groupby
+        groupby = self.conf[metric_name]['groupby']
+
         try:
-            qty = METRICS_CONF['services_units'][resource_name].keys()[0]
-            unit = METRICS_CONF['services_units'][resource_name].values()[0]
-        # NOTE(mc): deprecated except part kept for backward compatibility.
-        except KeyError:
-            LOG.warning('Error when trying to use yaml metrology conf.')
-            LOG.warning('Fallback on the deprecated oslo config method.')
-            qty, unit = self.units_mappings.get(
-                resource_name,
-                self.default_unit,
-            )
+            return self._conn.aggregates.fetch(
+                op,
+                resource_type=resource_type,
+                start=ck_utils.ts2dt(start),
+                stop=ck_utils.ts2dt(end),
+                groupby=groupby,
+                search=self.extend_filter(*query_parameters))
+        except (gexceptions.MetricNotFound, gexceptions.BadRequest) as e:
+            # FIXME(peschk_l): gnocchiclient seems to be raising a BadRequest
+            # when it should be raising MetricNotFound
+            if isinstance(e, gexceptions.BadRequest):
+                if 'Metrics not found' not in six.text_type(e):
+                    raise
+            LOG.warning('[{scope}] Skipping this metric for the '
+                        'current cycle.'.format(scope=project_id, err=e))
+            return []
 
-        resources = self.get_resources(resource_name, start, end,
-                                       project_id=project_id,
-                                       q_filter=q_filter)
-        formated_resources = list()
-        for resource in resources:
-            resource_data = self.t_gnocchi.strip_resource_data(
-                resource_name, resource)
+    def _format_data(self, metconf, data, resources_info=None):
+        """Formats gnocchi data to CK data.
 
+        Returns metadata, groupby and qty
+
+        """
+        groupby = data['group']
+        # if resource info is provided, add additional
+        # metadata as defined in the conf
+        metadata = dict()
+        if resources_info is not None:
+            resource_key = metconf['extra_args']['resource_key']
+            resource_id = groupby[resource_key]
             try:
-                mappings = METRICS_CONF['services_metrics'][resource_name]
-            # NOTE(mc): deprecated except part kept for backward compatibility.
+                resource = resources_info[resource_id]
             except KeyError:
-                LOG.warning('Error when trying to use yaml metrology conf.')
-                LOG.warning('Fallback on the deprecated oslo config method.')
-                mappings = self.metrics_mappings[resource_name]
+                raise AssociatedResourceNotFound(resource_key, resource_id)
+            for i in metconf['metadata']:
+                metadata[i] = resource.get(i, '')
+        qty = data['measures']['measures']['aggregated'][0][2]
+        converted_qty = ck_utils.convert_unit(
+            qty, metconf['factor'], metconf['offset'])
+        mutated_qty = ck_utils.mutate(converted_qty, metconf['mutate'])
+        return metadata, groupby, mutated_qty
 
-            self._expand_metrics([resource_data], mappings, start, end)
-            resource_data.pop('metrics', None)
-            # Convert network.bw.in, network.bw.out and image unit to MB
-            if resource.get('type') == 'instance_network_interface':
-                resource_data[qty] = (
-                    decimal.Decimal(resource_data[qty]) / units.M)
-            elif resource.get('type') == 'image':
-                resource_data[qty] = (
-                    decimal.Decimal(resource_data[qty]) / units.Mi)
-            data = self.t_cloudkitty.format_item(
-                resource_data, unit,
-                decimal.Decimal(
-                    qty if isinstance(qty, int) else resource_data[qty]))
-            # NOTE(sheeprine): Reference to gnocchi resource used by storage
-            data['resource_id'] = data['desc']['resource_id']
-            formated_resources.append(data)
+    def fetch_all(self, metric_name, start, end,
+                  project_id=None, q_filter=None):
+
+        met = self.conf[metric_name]
+
+        data = self._fetch_metric(
+            metric_name,
+            start,
+            end,
+            project_id=project_id,
+            q_filter=q_filter,
+        )
+
+        resources_info = None
+        if met['metadata']:
+            resources_info = self._fetch_resources(
+                metric_name,
+                start,
+                end,
+                project_id=project_id,
+                q_filter=q_filter
+            )
+        formated_resources = list()
+        for d in data:
+            # Only if aggregates have been found
+            if d['measures']['measures']['aggregated']:
+                try:
+                    metadata, groupby, qty = self._format_data(
+                        met, d, resources_info)
+                except AssociatedResourceNotFound as e:
+                    LOG.warning(
+                        '[{}] An error occured during data collection '
+                        'between {} and {}: {}'.format(
+                            project_id,
+                            ck_utils.ts2dt(start),
+                            ck_utils.ts2dt(end),
+                            e),
+                    )
+                    continue
+                data = self.t_cloudkitty.format_item(
+                    groupby,
+                    metadata,
+                    met['unit'],
+                    qty=qty,
+                )
+                formated_resources.append(data)
         return formated_resources
-
-    def retrieve(self, resource_name, start, end, project_id, q_filter=None):
-        resources = self.resource_info(resource_name, start, end,
-                                       project_id=project_id,
-                                       q_filter=q_filter)
-        if not resources:
-            raise collector.NoDataCollected(self.collector_name, resource_name)
-        return self.t_cloudkitty.format_service(resource_name, resources)

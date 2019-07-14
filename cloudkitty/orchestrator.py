@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# !/usr/bin/env python
 # Copyright 2014 Objectif Libre
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -17,8 +16,13 @@
 # @author: Stéphane Albert
 #
 import decimal
+import hashlib
+import multiprocessing
 import random
+import sys
+import time
 
+import cotyledon
 import eventlet
 from oslo_concurrency import lockutils
 from oslo_config import cfg
@@ -33,28 +37,38 @@ from cloudkitty import config  # noqa
 from cloudkitty import extension_manager
 from cloudkitty import messaging
 from cloudkitty import storage
+from cloudkitty import storage_state as state
 from cloudkitty import transformer
 from cloudkitty import utils as ck_utils
 
-eventlet.monkey_patch()
 
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
-CONF.import_opt('backend', 'cloudkitty.tenant_fetcher', 'tenant_fetcher')
 
 orchestrator_opts = [
-    cfg.StrOpt('coordination_url',
-               secret=True,
-               help='Coordination driver URL',
-               default='file:///var/lib/cloudkitty/locks'),
+    cfg.StrOpt(
+        'coordination_url',
+        secret=True,
+        help='Coordination driver URL',
+        default='file:///var/lib/cloudkitty/locks'),
+    cfg.IntOpt(
+        'max_workers',
+        default=multiprocessing.cpu_count(),
+        min=1,
+        help='Max nb of workers to run. Defaults to the nb of available CPUs'),
+    cfg.IntOpt('max_greenthreads', default=100, min=1,
+               help='Maximal number of greenthreads to use per worker.'),
 ]
+
 CONF.register_opts(orchestrator_opts, group='orchestrator')
 
-METRICS_CONF = ck_utils.get_metrics_conf(CONF.collect.metrics_conf)
+CONF.import_opt('backend', 'cloudkitty.fetcher', 'fetcher')
 
-FETCHERS_NAMESPACE = 'cloudkitty.tenant.fetchers'
+FETCHERS_NAMESPACE = 'cloudkitty.fetchers'
 PROCESSORS_NAMESPACE = 'cloudkitty.rating.processors'
+COLLECTORS_NAMESPACE = 'cloudkitty.collector.backends'
+STORAGES_NAMESPACE = 'cloudkitty.storage.backends'
 
 
 class RatingEndpoint(object):
@@ -151,30 +165,75 @@ class APIWorker(BaseWorker):
 
 
 class Worker(BaseWorker):
-    def __init__(self, collector, storage, tenant_id=None):
+    def __init__(self, collector, storage, tenant_id, worker_id):
         self._collector = collector
         self._storage = storage
-        self._period = METRICS_CONF['period']
-        self._wait_time = METRICS_CONF['wait_periods'] * self._period
+        self._period = CONF.collect.period
+        self._wait_time = CONF.collect.wait_periods * self._period
+        self._tenant_id = tenant_id
+        self._worker_id = worker_id
+        self._conf = ck_utils.load_conf(CONF.collect.metrics_conf)
+        self._state = state.StateManager()
 
-        super(Worker, self).__init__(tenant_id)
+        super(Worker, self).__init__(self._tenant_id)
 
-    def _collect(self, service, start_timestamp):
+    def _collect(self, metric, start_timestamp):
         next_timestamp = start_timestamp + self._period
-        raw_data = self._collector.retrieve(service,
-                                            start_timestamp,
-                                            next_timestamp,
-                                            self._tenant_id)
-        if raw_data:
-            return [{'period': {'begin': start_timestamp,
-                                'end': next_timestamp},
-                     'usage': raw_data}]
+
+        raw_data = self._collector.retrieve(
+            metric,
+            start_timestamp,
+            next_timestamp,
+            self._tenant_id,
+        )
+        if not raw_data:
+            raise collector.NoDataCollected
+
+        return {'period': {'begin': start_timestamp,
+                           'end': next_timestamp},
+                'usage': raw_data}
+
+    def _do_collection(self, metrics, timestamp):
+
+        def _get_result(metric):
+            try:
+                return self._collect(metric, timestamp)
+            except collector.NoDataCollected:
+                LOG.info(
+                    '[scope: {scope}, worker: {worker}] No data collected '
+                    'for metric {metric} at timestamp {ts}'.format(
+                        scope=self._tenant_id,
+                        worker=self._worker_id,
+                        metric=metric,
+                        ts=ck_utils.ts2dt(timestamp))
+                )
+                return None
+            except Exception as e:
+                LOG.warning(
+                    '[scope: {scope}, worker: {worker}] Error while collecting'
+                    ' metric {metric} at timestamp {ts}: {e}. Exiting.'.format(
+                        scope=self._tenant_id,
+                        worker=self._worker_id,
+                        metric=metric,
+                        ts=ck_utils.ts2dt(timestamp),
+                        e=e)
+                )
+                # FIXME(peschk_l): here we just exit, and the
+                # collection will be retried during the next collect
+                # cycle. In the future, we should implement a retrying
+                # system in workers
+                sys.exit(1)
+
+        return list(filter(
+            lambda x: x is not None,
+            eventlet.GreenPool(size=CONF.orchestrator.max_greenthreads).imap(
+                _get_result, metrics)))
 
     def check_state(self):
-        timestamp = self._storage.get_state(self._tenant_id)
+        timestamp = self._state.get_state(self._tenant_id)
         return ck_utils.check_time_state(timestamp,
                                          self._period,
-                                         self._wait_time)
+                                         CONF.collect.wait_periods)
 
     def run(self):
         while True:
@@ -182,46 +241,35 @@ class Worker(BaseWorker):
             if not timestamp:
                 break
 
-            for service in METRICS_CONF['services']:
-                try:
-                    try:
-                        data = self._collect(service, timestamp)
-                    except collector.NoDataCollected:
-                        raise
-                    except Exception as e:
-                        LOG.warning(
-                            'Error while collecting service '
-                            '%(service)s: %(error)s',
-                            {'service': service, 'error': e})
-                        raise collector.NoDataCollected('', service)
-                except collector.NoDataCollected:
-                    begin = timestamp
-                    end = begin + self._period
-                    for processor in self._processors:
-                        processor.obj.nodata(begin, end)
-                    self._storage.nodata(begin, end, self._tenant_id)
-                else:
-                    # Rating
-                    for processor in self._processors:
-                        processor.obj.process(data)
-                    # Writing
-                    self._storage.append(data, self._tenant_id)
+            metrics = list(self._conf['metrics'].keys())
 
-            # We're getting a full period so we directly commit
-            self._storage.commit(self._tenant_id)
+            # Collection
+            data = self._do_collection(metrics, timestamp)
+
+            # Rating
+            for processor in self._processors:
+                processor.obj.process(data)
+
+            # Writing
+            self._storage.push(data, self._tenant_id)
+            self._state.set_state(self._tenant_id, timestamp)
 
 
-class Orchestrator(object):
-    def __init__(self):
-        # Tenant fetcher
+class Orchestrator(cotyledon.Service):
+    def __init__(self, worker_id):
+        self._worker_id = worker_id
+        super(Orchestrator, self).__init__(self._worker_id)
+
         self.fetcher = driver.DriverManager(
             FETCHERS_NAMESPACE,
-            CONF.tenant_fetcher.backend,
-            invoke_on_load=True).driver
+            CONF.fetcher.backend,
+            invoke_on_load=True,
+        ).driver
 
-        self.transformers = transformer.get_transformers()
-        self.collector = collector.get_collector(self.transformers)
-        self.storage = storage.get_storage(self.collector)
+        transformers = transformer.get_transformers()
+        self.collector = collector.get_collector(transformers)
+        self.storage = storage.get_storage()
+        self._state = state.StateManager()
 
         # RPC
         self.server = None
@@ -232,18 +280,16 @@ class Orchestrator(object):
         self.coord = coordination.get_coordinator(
             CONF.orchestrator.coordination_url,
             uuidutils.generate_uuid().encode('ascii'))
-        self.coord.start()
-
-        self._period = METRICS_CONF['period']
-        self._wait_time = METRICS_CONF['wait_periods'] * self._period
+        self.coord.start(start_heart=True)
 
     def _lock(self, tenant_id):
-        lock_name = b"cloudkitty-" + str(tenant_id).encode('ascii')
-        return self.coord.get_lock(lock_name)
-
-    def _load_tenant_list(self):
-        self._tenants = self.fetcher.get_tenants()
-        random.shuffle(self._tenants)
+        name = hashlib.sha256(
+            ("cloudkitty-"
+             + str(tenant_id + '-')
+             + str(CONF.collect.collector + '-')
+             + str(CONF.fetcher.backend + '-')
+             + str(CONF.collect.scope_key)).encode('ascii')).hexdigest()
+        return name, self.coord.get_lock(name)
 
     def _init_messaging(self):
         target = oslo_messaging.Target(topic='cloudkitty',
@@ -256,10 +302,10 @@ class Orchestrator(object):
         self.server.start()
 
     def _check_state(self, tenant_id):
-        timestamp = self.storage.get_state(tenant_id)
+        timestamp = self._state.get_state(tenant_id)
         return ck_utils.check_time_state(timestamp,
-                                         self._period,
-                                         self._wait_time)
+                                         CONF.collect.period,
+                                         CONF.collect.wait_periods)
 
     def process_messages(self):
         # TODO(sheeprine): Code kept to handle threading and asynchronous
@@ -268,28 +314,50 @@ class Orchestrator(object):
         # pending_states = self._rating_endpoint.get_module_state()
         pass
 
-    def process(self):
+    def run(self):
+        LOG.debug('Started worker {}.'.format(self._worker_id))
         while True:
-            self.process_messages()
-            self._load_tenant_list()
-            while len(self._tenants):
-                for tenant in self._tenants[:]:
-                    lock = self._lock(tenant)
-                    if lock.acquire(blocking=False):
-                        if not self._check_state(tenant):
-                            self._tenants.remove(tenant)
-                        else:
-                            worker = Worker(self.collector,
-                                            self.storage,
-                                            tenant)
-                            worker.run()
-                        lock.release()
-                    self.coord.heartbeat()
-                # NOTE(sheeprine): Slow down looping if all tenants are
-                # being processed
-                eventlet.sleep(1)
+            self.tenants = self.fetcher.get_tenants()
+            random.shuffle(self.tenants)
+            LOG.info('[Worker: {w}] Tenants loaded for fetcher {f}'.format(
+                w=self._worker_id, f=self.fetcher.name))
+
+            for tenant_id in self.tenants:
+
+                lock_name, lock = self._lock(tenant_id)
+                LOG.debug(
+                    '[Worker: {w}] Trying to acquire lock "{l}" ...'.format(
+                        w=self._worker_id, l=lock_name)
+                )
+                if lock.acquire(blocking=False):
+                    LOG.debug(
+                        '[Worker: {w}] Acquired lock "{l}" ...'.format(
+                            w=self._worker_id, l=lock_name)
+                    )
+                    state = self._check_state(tenant_id)
+                    if state:
+                        worker = Worker(
+                            self.collector,
+                            self.storage,
+                            tenant_id,
+                            self._worker_id,
+                        )
+                        worker.run()
+
+                    lock.release()
+
             # FIXME(sheeprine): We may cause a drift here
-            eventlet.sleep(self._period)
+            time.sleep(CONF.collect.period)
 
     def terminate(self):
+        LOG.debug('Terminating worker {}...'.format(self._worker_id))
         self.coord.stop()
+        LOG.debug('Terminated worker {}.'.format(self._worker_id))
+
+
+class OrchestratorServiceManager(cotyledon.ServiceManager):
+
+    def __init__(self):
+        super(OrchestratorServiceManager, self).__init__()
+        self.service_id = self.add(Orchestrator,
+                                   workers=CONF.orchestrator.max_workers)

@@ -18,17 +18,14 @@
 import decimal
 
 from oslo_config import cfg
+from oslo_log import log
 from wsme import types as wtypes
 
 from cloudkitty.api.v1 import types as cktypes
-from cloudkitty import utils as ck_utils
+
+LOG = log.getLogger(__name__)
 
 CONF = cfg.CONF
-
-METRICS_CONF = ck_utils.get_metrics_conf(CONF.collect.metrics_conf)
-
-CLOUDKITTY_SERVICES = wtypes.Enum(wtypes.text,
-                                  *METRICS_CONF['services'])
 
 
 class CloudkittyResource(wtypes.Base):
@@ -36,7 +33,7 @@ class CloudkittyResource(wtypes.Base):
 
     """
 
-    service = CLOUDKITTY_SERVICES
+    service = wtypes.text
     """Name of the service."""
 
     # FIXME(sheeprine): values should be dynamic

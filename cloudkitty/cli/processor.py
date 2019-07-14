@@ -22,16 +22,12 @@ def main():
     service.prepare_service()
 
     # NOTE(mc): This import is done here to ensure that the prepare_service()
-    # fonction is called before any cfg option. By importing the orchestrator
-    # file, the utils one is imported too, and then some cfg option are read
+    # function is called before any cfg option. By importing the orchestrator
+    # file, the utils one is imported too, and then some cfg options are read
     # before the prepare_service(), making cfg.CONF returning default values
     # systematically.
     from cloudkitty import orchestrator
-    processor = orchestrator.Orchestrator()
-    try:
-        processor.process()
-    except KeyboardInterrupt:
-        processor.terminate()
+    orchestrator.OrchestratorServiceManager().run()
 
 
 if __name__ == '__main__':

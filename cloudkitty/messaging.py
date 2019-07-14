@@ -33,7 +33,7 @@ def get_transport(url=None, optional=False, cache=True):
     transport = TRANSPORTS.get(cache_key)
     if not transport or not cache:
         try:
-            transport = oslo_messaging.get_transport(cfg.CONF, url)
+            transport = oslo_messaging.get_rpc_transport(cfg.CONF, url)
         except (oslo_messaging.InvalidTransportURL,
                 oslo_messaging.DriverLoadFailure):
             if not optional or url:
@@ -66,7 +66,7 @@ def get_server(target=None, endpoints=None):
     if not target:
         target = get_target()
     return oslo_messaging.get_rpc_server(transport, target,
-                                         endpoints, executor='eventlet',
+                                         endpoints, executor='threading',
                                          access_policy=access_policy)
 
 

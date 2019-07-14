@@ -132,7 +132,11 @@ function configure_cloudkitty {
 
     touch $CLOUDKITTY_CONF
 
-    cp $CLOUDKITTY_DIR$CLOUDKITTY_CONF_DIR/policy.json $CLOUDKITTY_CONF_DIR
+    # generate policy sample file
+    oslopolicy-sample-generator --config-file $CLOUDKITTY_DIR/etc/oslo-policy-generator/cloudkitty.conf --output-file $CLOUDKITTY_DIR/etc/cloudkitty/policy.yaml.sample
+    cp $CLOUDKITTY_DIR/etc/cloudkitty/policy.yaml.sample "$CLOUDKITTY_CONF_DIR/policy.yaml"
+    iniset $CLOUDKITTY_CONF oslo_policy policy_file 'policy.yaml'
+
     cp $CLOUDKITTY_DIR$CLOUDKITTY_CONF_DIR/api_paste.ini $CLOUDKITTY_CONF_DIR
     cp $CLOUDKITTY_DIR$CLOUDKITTY_CONF_DIR/metrics.yml $CLOUDKITTY_CONF_DIR
     iniset_rpc_backend cloudkitty $CLOUDKITTY_CONF DEFAULT
@@ -155,19 +159,36 @@ function configure_cloudkitty {
     iniset $CLOUDKITTY_CONF authinfos project_domain_name default
     iniset $CLOUDKITTY_CONF authinfos debug "$ENABLE_DEBUG_LOG_LEVEL"
 
-    iniset $CLOUDKITTY_CONF keystone_fetcher auth_section authinfos
-    iniset $CLOUDKITTY_CONF keystone_fetcher keystone_version 3
+    iniset $CLOUDKITTY_CONF fetcher backend $CLOUDKITTY_FETCHER
+    iniset $CLOUDKITTY_CONF "fetcher_$CLOUDKITTY_FETCHER" auth_section authinfos
+    if [[ "$CLOUDKITTY_FETCHER" == "keystone" ]]; then
+        iniset $CLOUDKITTY_CONF fetcher_keystone keystone_version 3
+    fi
+
+    if [ "$CLOUDKITTY_STORAGE_BACKEND" == "influxdb" ]; then
+        iniset $CLOUDKITTY_CONF storage_${CLOUDKITTY_STORAGE_BACKEND} user ${CLOUDKITTY_INFLUXDB_USER}
+        iniset $CLOUDKITTY_CONF storage_${CLOUDKITTY_STORAGE_BACKEND} password ${CLOUDKITTY_INFLUXDB_PASSWORD}
+        iniset $CLOUDKITTY_CONF storage_${CLOUDKITTY_STORAGE_BACKEND} database ${CLOUDKITTY_INFLUXDB_DATABASE}
+        iniset $CLOUDKITTY_CONF storage_${CLOUDKITTY_STORAGE_BACKEND} host ${CLOUDKITTY_INFLUXDB_HOST}
+        iniset $CLOUDKITTY_CONF storage_${CLOUDKITTY_STORAGE_BACKEND} port ${CLOUDKITTY_INFLUXDB_PORT}
+    fi
 
     # collect
     iniset $CLOUDKITTY_CONF collect collector $CLOUDKITTY_COLLECTOR
-    iniset $CLOUDKITTY_CONF ${CLOUDKITTY_COLLECTOR}_collector auth_section authinfos
-    iniset $CLOUDKITTY_CONF collect services $CLOUDKITTY_SERVICES
+    iniset $CLOUDKITTY_CONF "collector_${CLOUDKITTY_COLLECTOR}" auth_section authinfos
     iniset $CLOUDKITTY_CONF collect metrics_conf $CLOUDKITTY_CONF_DIR/$CLOUDKITTY_METRICS_CONF
+    # DO NOT DO THIS IN PRODUCTION! This is done in order to get data quicker
+    # when starting a devstack installation, but is NOT a recommended setting
+    iniset $CLOUDKITTY_CONF collect wait_periods 0
 
     # output
     iniset $CLOUDKITTY_CONF output backend $CLOUDKITTY_OUTPUT_BACKEND
     iniset $CLOUDKITTY_CONF output basepath $CLOUDKITTY_OUTPUT_BASEPATH
     iniset $CLOUDKITTY_CONF output pipeline $CLOUDKITTY_OUTPUT_PIPELINE
+
+    # storage
+    iniset $CLOUDKITTY_CONF storage backend $CLOUDKITTY_STORAGE_BACKEND
+    iniset $CLOUDKITTY_CONF storage version $CLOUDKITTY_STORAGE_VERSION
 
     # database
     local dburl=`database_connection_url cloudkitty`
@@ -178,6 +199,13 @@ function configure_cloudkitty {
 
     if is_service_enabled ck-api && [ "$CLOUDKITTY_USE_MOD_WSGI" == "True" ]; then
         _cloudkitty_config_apache_wsgi
+    fi
+}
+
+function wait_for_gnocchi() {
+    local gnocchi_url=$(openstack --os-cloud devstack-admin endpoint list --service metric --interface public -c URL -f value)
+    if ! wait_for_service $SERVICE_TIMEOUT $gnocchi_url; then
+       die $LINENO "Waited for gnocchi too long."
     fi
 }
 
@@ -203,6 +231,12 @@ function create_cloudkitty_data_dir {
     sudo chown $STACK_USER $CLOUDKITTY_DATA_DIR/locks
 }
 
+function create_influxdb_database {
+    if [ "$CLOUDKITTY_STORAGE_BACKEND" == "influxdb" ]; then
+        influx -execute "CREATE DATABASE ${CLOUDKITTY_INFLUXDB_DATABASE}"
+    fi
+}
+
 # init_cloudkitty() - Initialize CloudKitty database
 function init_cloudkitty {
     # Delete existing cache
@@ -218,20 +252,51 @@ function init_cloudkitty {
     # (Re)create cloudkitty database
     recreate_database cloudkitty utf8
 
+    create_influxdb_database
+
     # Migrate cloudkitty database
     $CLOUDKITTY_BIN_DIR/cloudkitty-dbsync upgrade
 
     # Init the storage backend
+    if [ $CLOUDKITTY_STORAGE_BACKEND == 'hybrid' ]; then
+        wait_for_gnocchi
+    fi
     $CLOUDKITTY_BIN_DIR/cloudkitty-storage-init
 
     create_cloudkitty_cache_dir
     create_cloudkitty_data_dir
 }
 
+function install_influx_ubuntu {
+    local influxdb_file=$(get_extra_file https://dl.influxdata.com/influxdb/releases/influxdb_1.6.3_amd64.deb)
+    sudo dpkg -i --skip-same-version ${influxdb_file}
+}
+
+function install_influx_fedora {
+    local influxdb_file=$(get_extra_file https://dl.influxdata.com/influxdb/releases/influxdb-1.6.3.x86_64.rpm)
+    sudo yum localinstall -y ${influxdb_file}
+}
+
+function install_influx {
+    if is_ubuntu; then
+        install_influx_ubuntu
+    elif is_fedora; then
+        install_influx_fedora
+    else
+        die $LINENO "Distribution must be Debian or Fedora-based"
+    fi
+    sudo cp -f "${CLOUDKITTY_DIR}"/devstack/files/influxdb.conf /etc/influxdb/influxdb.conf
+    sudo systemctl start influxdb || sudo systemctl restart influxdb
+}
+
 # install_cloudkitty() - Collect source and prepare
 function install_cloudkitty {
     git_clone $CLOUDKITTY_REPO $CLOUDKITTY_DIR $CLOUDKITTY_BRANCH
     setup_develop $CLOUDKITTY_DIR
+
+    if [ $CLOUDKITTY_STORAGE_BACKEND == 'influxdb' ]; then
+        install_influx
+    fi
 }
 
 # start_cloudkitty() - Start running processes, including screen
@@ -244,8 +309,6 @@ function start_cloudkitty {
         echo_summary "Waiting 15s for cloudkitty-processor to authenticate against keystone before apache is restarted."
         sleep 15s
         restart_apache_server
-        tail_log cloudkitty /var/log/$APACHE_NAME/cloudkitty.log
-        tail_log cloudkitty-api /var/log/$APACHE_NAME/cloudkitty_access.log
     fi
     echo "Waiting for ck-api ($CLOUDKITTY_SERVICE_HOST:$CLOUDKITTY_SERVICE_PORT) to start..."
     if ! wait_for_service $SERVICE_TIMEOUT $CLOUDKITTY_SERVICE_PROTOCOL://$CLOUDKITTY_SERVICE_HOST:$CLOUDKITTY_SERVICE_PORT; then

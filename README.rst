@@ -53,7 +53,7 @@ We are welcoming new contributors, if you've got new ideas, suggestions or want
 to contribute contact us.
 
 You can reach us thought IRC (#cloudkitty @freenode.net), or on the official
-OpenStack mailing list openstack-dev@lists.openstack.org.
+OpenStack mailing list openstack-discuss@lists.openstack.org.
 
 A storyboard_ is available if you need to report bugs.
 
@@ -79,19 +79,25 @@ Deploying it in production
 
 CloudKitty can be deployed in production on OpenStack Kilo environments, for
 more information check the `installation section`_ of the documentation. Due to
-oslo libraires new namespace backward compatibility is not possible. If you
+oslo libraries new namespace backward compatibility is not possible. If you
 want to install it on an older system, use a virtualenv.
+
+Getting release notes
+---------------------
+
+Release notes can be found in the `release notes section`_ of the
+documentation.
 
 
 .. Global references and images
 
 .. |doc-status|
    image:: https://readthedocs.org/projects/cloudkitty/badge/?version=latest
-   :target: http://cloudkitty.readthedocs.io/en/latest/
+   :target: https://cloudkitty.readthedocs.io/en/latest/
    :alt: Documentation Status
 
 
-.. _readthedocs: http://cloudkitty.readthedocs.io/en/latest/
+.. _readthedocs: https://cloudkitty.readthedocs.io/en/latest/
 
 
 .. _storyboard: https://storyboard.openstack.org/#!/project/890
@@ -110,3 +116,5 @@ want to install it on an older system, use a virtualenv.
 
 
 .. _installation section: https://cloudkitty.readthedocs.io/en/latest/installation.html
+
+.. _release notes section: https://docs.openstack.org/releasenotes/cloudkitty/

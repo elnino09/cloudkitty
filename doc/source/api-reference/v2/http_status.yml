@@ -1,0 +1,17 @@
+200:
+  default: Request was successful.
+
+201:
+  default: Resource was successfully created.
+
+400:
+  default: Invalid request.
+
+403:
+  default: Forbidden operation for the authentified user.
+
+404:
+  default: Not found
+
+405:
+  default: The method is not allowed for the requested URL.

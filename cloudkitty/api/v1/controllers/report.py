@@ -18,6 +18,8 @@
 import datetime
 import decimal
 
+from oslo_config import cfg
+from oslo_log import log as logging
 import pecan
 from pecan import rest
 from wsme import types as wtypes
@@ -26,6 +28,16 @@ import wsmeext.pecan as wsme_pecan
 from cloudkitty.api.v1.datamodels import report as report_models
 from cloudkitty.common import policy
 from cloudkitty import utils as ck_utils
+
+LOG = logging.getLogger(__name__)
+
+CONF = cfg.CONF
+
+CONF.import_opt('scope_key', 'cloudkitty.collector', 'collect')
+
+
+class InvalidFilter(Exception):
+    """Exception raised when a storage filter is invalid"""
 
 
 class ReportController(rest.RestController):
@@ -46,7 +58,7 @@ class ReportController(rest.RestController):
         """Return the list of rated tenants.
 
         """
-        policy.enforce(pecan.request.context, 'report:list_tenants', {})
+        policy.authorize(pecan.request.context, 'report:list_tenants', {})
 
         if not begin:
             begin = ck_utils.get_month_start()
@@ -68,6 +80,8 @@ class ReportController(rest.RestController):
         """Return the amount to pay for a given period.
 
         """
+        LOG.warning('/v1/report/total is deprecated, please use '
+                    '/v1/report/summary instead.')
         if not begin:
             begin = ck_utils.get_month_start()
         if not end:
@@ -76,21 +90,27 @@ class ReportController(rest.RestController):
         if all_tenants:
             tenant_id = None
         else:
-            tenant_context = pecan.request.context.tenant
+            tenant_context = pecan.request.context.project_id
             tenant_id = tenant_context if not tenant_id else tenant_id
-        policy.enforce(pecan.request.context, 'report:get_total',
-                       {"tenant_id": tenant_id})
+        policy.authorize(pecan.request.context, 'report:get_total',
+                         {"tenant_id": tenant_id})
 
         storage = pecan.request.storage_backend
         # FIXME(sheeprine): We should filter on user id.
         # Use keystone token information by default but make it overridable and
         # enforce it by policy engine
-        total = storage.get_total(begin, end, tenant_id, service)
+        scope_key = CONF.collect.scope_key
+        groupby = [scope_key]
+        filters = {scope_key: tenant_id} if tenant_id else None
+        result = storage.total(
+            groupby=groupby,
+            begin=begin, end=end,
+            metric_types=service,
+            filters=filters)
 
-        # TODO(Aaron): `get_total` return a list of dict,
-        # Get value of rate from index[0]
-        total = total[0].get('rate', decimal.Decimal('0'))
-        return total if total else decimal.Decimal('0')
+        if result['total'] < 1:
+            return decimal.Decimal('0')
+        return sum(total['rate'] for total in result['results'])
 
     @wsme_pecan.wsexpose(report_models.SummaryCollectionModel,
                          datetime.datetime,
@@ -112,17 +132,35 @@ class ReportController(rest.RestController):
         if all_tenants:
             tenant_id = None
         else:
-            tenant_context = pecan.request.context.tenant
+            tenant_context = pecan.request.context.project_id
             tenant_id = tenant_context if not tenant_id else tenant_id
-        policy.enforce(pecan.request.context, 'report:get_summary',
-                       {"tenant_id": tenant_id})
+        policy.authorize(pecan.request.context, 'report:get_summary',
+                         {"tenant_id": tenant_id})
         storage = pecan.request.storage_backend
 
+        scope_key = CONF.collect.scope_key
+        storage_groupby = []
+        if groupby is not None and 'tenant_id' in groupby:
+            storage_groupby.append(scope_key)
+        if groupby is not None and 'res_type' in groupby:
+            storage_groupby.append('type')
+        filters = {scope_key: tenant_id} if tenant_id else None
+        result = storage.total(
+            groupby=storage_groupby,
+            begin=begin, end=end,
+            metric_types=service,
+            filters=filters)
+
         summarymodels = []
-        results = storage.get_total(begin, end, tenant_id, service,
-                                    groupby=groupby)
-        for result in results:
-            summarymodel = report_models.SummaryModel(**result)
+        for res in result['results']:
+            kwargs = {
+                'res_type': res.get('type') or res.get('res_type'),
+                'tenant_id': res.get(scope_key) or res.get('tenant_id'),
+                'begin': res['begin'],
+                'end': res['end'],
+                'rate': res['rate'],
+            }
+            summarymodel = report_models.SummaryModel(**kwargs)
             summarymodels.append(summarymodel)
 
         return report_models.SummaryCollectionModel(summary=summarymodels)

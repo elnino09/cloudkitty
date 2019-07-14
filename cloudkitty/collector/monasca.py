@@ -15,14 +15,16 @@
 #
 # @author: Luka Peschke
 #
-import decimal
-
 from keystoneauth1 import loading as ks_loading
 from keystoneclient.v3 import client as ks_client
 from monascaclient import client as mclient
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import units
+from voluptuous import All
+from voluptuous import In
+from voluptuous import Length
+from voluptuous import Required
+from voluptuous import Schema
 
 from cloudkitty import collector
 from cloudkitty import transformer
@@ -33,70 +35,69 @@ LOG = logging.getLogger(__name__)
 
 MONASCA_API_VERSION = '2_0'
 COLLECTOR_MONASCA_OPTS = 'collector_monasca'
-collector_monasca_opts = ks_loading.get_auth_common_conf_options()
 
-cfg.CONF.register_opts(collector_monasca_opts, COLLECTOR_MONASCA_OPTS)
-ks_loading.register_session_conf_options(
-    cfg.CONF,
-    COLLECTOR_MONASCA_OPTS)
-ks_loading.register_auth_conf_options(
-    cfg.CONF,
-    COLLECTOR_MONASCA_OPTS)
+keystone_opts = ks_loading.get_auth_common_conf_options() + \
+    ks_loading.get_session_conf_options()
+
+collector_monasca_opts = [
+    cfg.StrOpt(
+        'interface',
+        default='internal',
+        help='Endpoint URL type (defaults to internal)',
+    ),
+    cfg.StrOpt(
+        'monasca_service_name',
+        default='monasca',
+        help='Name of the Monasca service (defaults to monasca)',
+    ),
+]
+
 CONF = cfg.CONF
+CONF.register_opts(keystone_opts, COLLECTOR_MONASCA_OPTS)
+CONF.register_opts(collector_monasca_opts, COLLECTOR_MONASCA_OPTS)
 
-METRICS_CONF = ck_utils.get_metrics_conf(CONF.collect.metrics_conf)
+METRICS_CONF = ck_utils.load_conf(CONF.collect.metrics_conf)
+
+MONASCA_EXTRA_SCHEMA = {
+    Required('extra_args'): {
+        # Key corresponding to the resource id in a metric's dimensions
+        # Allows to adapt the resource identifier. Should not need to be
+        # modified in a standard OpenStack installation
+        Required('resource_key', default='resource_id'):
+            All(str, Length(min=1)),
+        Required('aggregation_method', default='max'):
+            In(['max', 'mean', 'min']),
+        # In case the metrics in Monasca do not belong to the project
+        # cloudkitty is identified in
+        Required('forced_project_id', default=''): str,
+    },
+}
 
 
 class EndpointNotFound(Exception):
     """Exception raised if the Monasca endpoint is not found"""
-    pass
 
 
 class MonascaCollector(collector.BaseCollector):
     collector_name = 'monasca'
-    dependencies = ['CloudKittyFormatTransformer']
-    retrieve_mappings = {
-        'compute': 'cpu',
-        'image': 'image.size',
-        'volume': 'volume.size',
-        'network.floating': 'ip.floating',
-        'network.bw.in': 'network.incoming.bytes',
-        'network.bw.out': 'network.outgoing.bytes',
-    }
-    metrics_mappings = {
-        'compute': [
-            ('cpu', 'max'),
-            ('vpcus', 'max'),
-            ('memory', 'max')],
-        'image': [
-            ('image.size', 'max'),
-            ('image.download', 'max'),
-            ('image.serve', 'max')],
-        'volume': [
-            ('volume.size', 'max')],
-        'network.bw.in': [
-            ('network.incoming.bytes', 'max')],
-        'network.bw.out': [
-            ('network.outgoing.bytes', 'max')],
-        'network.floating': [
-            ('ip.floating', 'max')],
-    }
-    # (qty, unit). qty must be either a metric name, an integer
-    # or a decimal.Decimal object
-    units_mappings = {
-        'compute': (1, 'instance'),
-        'image': ('image.size', 'MB'),
-        'volume': ('volume.size', 'GB'),
-        'network.bw.out': ('network.outgoing.bytes', 'MB'),
-        'network.bw.in': ('network.incoming.bytes', 'MB'),
-        'network.floating': (1, 'ip'),
-    }
-    default_unit = (1, 'unknown')
+
+    @staticmethod
+    def check_configuration(conf):
+        conf = collector.BaseCollector.check_configuration(conf)
+        metric_schema = Schema(collector.METRIC_BASE_SCHEMA).extend(
+            MONASCA_EXTRA_SCHEMA)
+
+        output = {}
+        for metric_name, metric in conf.items():
+            met = output[metric_name] = metric_schema(metric)
+
+            if met['extra_args']['resource_key'] not in met['groupby']:
+                met['groupby'].append(met['extra_args']['resource_key'])
+
+        return output
 
     def __init__(self, transformers, **kwargs):
         super(MonascaCollector, self).__init__(transformers, **kwargs)
-
-        self.t_cloudkitty = self.transformers['CloudKittyFormatTransformer']
 
         self.auth = ks_loading.load_auth_from_conf_options(
             CONF,
@@ -109,8 +110,6 @@ class MonascaCollector(collector.BaseCollector):
         self.mon_endpoint = self._get_monasca_endpoint()
         if not self.mon_endpoint:
             raise EndpointNotFound()
-        # NOTE (lukapeschke) session authentication should be possible starting
-        # with OpenStack Q release.
         self._conn = mclient.Client(
             api_version=MONASCA_API_VERSION,
             session=self.session,
@@ -118,8 +117,10 @@ class MonascaCollector(collector.BaseCollector):
 
     # NOTE(lukapeschke) This function should be removed as soon as the endpoint
     # it no longer required by monascaclient
-    def _get_monasca_endpoint(self, service_name='monasca',
-                              endpoint_interface_type='public'):
+    def _get_monasca_endpoint(self):
+        service_name = cfg.CONF.collector_monasca.monasca_service_name
+        endpoint_interface_type = cfg.CONF.collector_monasca.interface
+
         service_list = self.ks_client.services.list(name=service_name)
         if not service_list:
             return None
@@ -130,209 +131,149 @@ class MonascaCollector(collector.BaseCollector):
                 return endpoint.url
         return None
 
-    def _get_metadata(self, resource_type, transformers):
+    def _get_metadata(self, metric_name, transformers, conf):
         info = {}
-        try:
-            info['unit'] = METRICS_CONF['services_units']
-        # NOTE(mc): deprecated second try kept for backward compatibility.
-        except KeyError:
-            LOG.warning('Error when trying to use yaml metrology conf.')
-            LOG.warning('Fallback on the deprecated oslo config method.')
-            try:
-                info['unit'] = self.units_mappings[resource_type][1]
-            except (KeyError, IndexError):
-                info['unit'] = self.default_unit[1]
+        info['unit'] = conf['metrics'][metric_name]['unit']
 
-        start = ck_utils.dt2ts(ck_utils.get_month_start())
-        end = ck_utils.dt2ts(ck_utils.get_month_end())
-        try:
-            resource_id = self.active_resources(resource_type, start,
-                                                end, None)[0]
-        except IndexError:
-            resource_id = ''
-        metadata = self._get_resource_metadata(resource_type, start,
-                                               end, resource_id)
-        info['metadata'] = metadata.keys()
-
-        try:
-            for metric, statistics in METRICS_CONF['services_metrics']:
-                info['metadata'].append(metric)
-        # NOTE(mc): deprecated second try kept for backward compatibility.
-        except KeyError:
-            LOG.warning('Error when trying to use yaml metrology conf.')
-            LOG.warning('Fallback on the deprecated oslo config method.')
-            try:
-                for metric, statistics in self.metrics_mappings[resource_type]:
-                    info['metadata'].append(metric)
-            except (KeyError, IndexError):
-                pass
+        dimension_names = self._conn.metric.list_dimension_names(
+            metric_name=metric_name)
+        info['metadata'] = [d['dimension_name'] for d in dimension_names]
         return info
 
     # NOTE(lukapeschke) if anyone sees a better way to do this,
     # please make a patch
     @classmethod
-    def get_metadata(cls, resource_type, transformers):
+    def get_metadata(cls, resource_type, transformers, conf):
         args = {
             'transformers': transformer.get_transformers(),
-            'period': CONF.collect.period}
+            'period': conf['period']}
         tmp = cls(**args)
-        return tmp._get_metadata(resource_type, transformers)
+        return tmp._get_metadata(resource_type, transformers, conf)
 
-    def _get_resource_metadata(self, resource_type, start, end, resource_id):
-        try:
-            meter = METRICS_CONF['services_objects'].get(resource_type)
-        # NOTE(mc): deprecated except part kept for backward compatibility.
-        except KeyError:
-            LOG.warning('Error when trying to use yaml metrology conf.')
-            LOG.warning('Fallback on the deprecated oslo config method.')
-            meter = self.retrieve_mappings.get(resource_type)
-
-        if not meter:
-            return {}
-        measurements = self._conn.metrics.list_measurements(
-            name=meter,
-            start_time=ck_utils.ts2dt(start),
-            end_time=ck_utils.ts2dt(end),
-            merge_metrics=True,
-            dimensions={'resource_id': resource_id},
-        )
-        try:
-            # Getting the last measurement of given period
-            metadata = measurements[-1]['measurements'][-1][2]
-        except (KeyError, IndexError):
-            metadata = {}
-        return metadata
-
-    def _get_resource_qty(self, meter, start, end, resource_id, statistics):
-        # NOTE(lukapeschke) the period trick is used to aggregate
-        # the measurements
-        period = end - start
-        statistics = self._conn.metrics.list_statistics(
-            name=meter,
-            start_time=ck_utils.ts2dt(start),
-            end_time=ck_utils.ts2dt(end),
-            dimensions={'resource_id': resource_id},
-            statistics=statistics,
-            period=period,
-            merge_metrics=True,
-        )
-        try:
-            # If several statistics are returned (should not happen),
-            # use the latest
-            qty = decimal.Decimal(statistics[-1]['statistics'][-1][1])
-        except (KeyError, IndexError):
-            qty = decimal.Decimal(0)
-        return qty
-
-    def _is_resource_active(self, meter, resource_id, start, end):
-        measurements = self._conn.metrics.list_measurements(
-            name=meter,
-            start_time=ck_utils.ts2dt(start),
-            end_time=ck_utils.ts2dt(end),
-            group_by='resource_id',
-            merge_metrics=True,
-            dimensions={'resource_id': resource_id},
-        )
-        return len(measurements) > 0
-
-    def active_resources(self, resource_type, start,
-                         end, project_id, **kwargs):
-        try:
-            meter = METRICS_CONF['services_objects'].get(resource_type)
-        # NOTE(mc): deprecated except part kept for backward compatibility.
-        except KeyError:
-            LOG.warning('Error when trying to use yaml metrology conf.')
-            LOG.warning('Fallback on the deprecated oslo config method.')
-            meter = self.retrieve_mappings.get(resource_type)
-
-        if not meter:
-            return {}
+    def _get_dimensions(self, metric_name, project_id, q_filter):
         dimensions = {}
-        dimensions.update(kwargs)
+        scope_key = CONF.collect.scope_key
         if project_id:
-            resources = self._conn.metrics.list(name=meter,
-                                                tenant_id=project_id,
-                                                **dimensions)
-        else:
-            resources = self._conn.metrics.list(name=meter,
-                                                **dimensions)
-        resource_ids = []
-        for resource in resources:
-            try:
-                resource_id = resource['dimensions']['resource_id']
-                if (resource_id not in resource_ids
-                        and self._is_resource_active(meter, resource_id,
-                                                     start, end)):
-                    resource_ids.append(resource_id)
-            except KeyError:
-                continue
-        return resource_ids
+            dimensions[scope_key] = project_id
+        if q_filter:
+            dimensions.update(q_filter)
+        return dimensions
 
-    def _expand_metrics(self, resource, resource_id, mappings, start, end):
-        for name, statistics in mappings:
-            qty = self._get_resource_qty(name, start,
-                                         end, resource_id, statistics)
-            if name in ['network.outgoing.bytes', 'network.incoming.bytes']:
-                qty = qty / units.M
-            elif 'image.' in name:
-                qty = qty / units.Mi
-            resource[name] = qty
+    def _fetch_measures(self, metric_name, start, end,
+                        project_id=None, q_filter=None):
+        """Get measures for given metric during the timeframe.
 
-    def resource_info(self, resource_type, start, end,
-                      project_id, q_filter=None):
+        :param metric_name: metric name to filter on.
+        :type metric_name: str
+        :param start: Start of the timeframe.
+        :param end: End of the timeframe if needed.
+        :param project_id: Filter on a specific tenant/project.
+        :type project_id: str
+        :param q_filter: Append a custom filter.
+        :type q_filter: list
+        """
 
-        try:
-            qty, unit = METRICS_CONF['services_units'].get(
-                resource_type,
-                self.default_unit
-            )
-        # NOTE(mc): deprecated except part kept for backward compatibility.
-        except KeyError:
-            LOG.warning('Error when trying to use yaml metrology conf.')
-            LOG.warning('Fallback on the deprecated oslo config method.')
-            qty, unit = self.units_mappings.get(
-                resource_type,
-                self.default_unit
-            )
+        dimensions = self._get_dimensions(metric_name, project_id, q_filter)
+        group_by = self.conf[metric_name]['groupby']
 
-        active_resource_ids = self.active_resources(
-            resource_type, start, end, project_id
+        # NOTE(lpeschke): One aggregated measure per collect period
+        period = end - start
+
+        extra_args = self.conf[metric_name]['extra_args']
+        kwargs = {}
+        if extra_args['forced_project_id']:
+            kwargs['tenant_id'] = extra_args['forced_project_id']
+
+        return self._conn.metrics.list_statistics(
+            name=metric_name,
+            merge_metrics=True,
+            dimensions=dimensions,
+            start_time=ck_utils.ts2dt(start),
+            end_time=ck_utils.ts2dt(end),
+            period=period,
+            statistics=extra_args['aggregation_method'],
+            group_by=group_by,
+            **kwargs)
+
+    def _fetch_metrics(self, metric_name, start, end,
+                       project_id=None, q_filter=None):
+        """List active metrics during the timeframe.
+
+        :param metric_name: metric name to filter on.
+        :type metric_name: str
+        :param start: Start of the timeframe.
+        :param end: End of the timeframe if needed.
+        :param project_id: Filter on a specific tenant/project.
+        :type project_id: str
+        :param q_filter: Append a custom filter.
+        :type q_filter: list
+        """
+        dimensions = self._get_dimensions(metric_name, project_id, q_filter)
+        metrics = self._conn.metrics.list(
+            name=metric_name,
+            dimensions=dimensions,
+            start_time=ck_utils.ts2dt(start),
+            end_time=ck_utils.ts2dt(end),
         )
-        resource_data = []
-        for resource_id in active_resource_ids:
-            data = self._get_resource_metadata(resource_type, start,
-                                               end, resource_id)
 
-            try:
-                mappings = METRICS_CONF['services_metrics'][resource_type]
-            # NOTE(mc): deprecated except part kept for backward compatibility.
-            except KeyError:
-                LOG.warning('Error when trying to use yaml metrology conf.')
-                LOG.warning('Fallback on the deprecated oslo config method.')
-                mappings = self.metrics_mappings[resource_type]
+        resource_key = self.conf[metric_name]['extra_args']['resource_key']
 
-            self._expand_metrics(data, resource_id, mappings, start, end)
-            resource_qty = qty
-            if not (isinstance(qty, int) or isinstance(qty, decimal.Decimal)):
-                try:
-                    resource_qty = METRICS_CONF['services_objects']
-                # NOTE(mc): deprecated except part kept for backward compat.
-                except KeyError:
-                    LOG.warning('Error when trying to use yaml metrology conf')
-                    msg = 'Fallback on the deprecated oslo config method'
-                    LOG.warning(msg)
-                    resource_qty = data[self.retrieve_mappings[resource_type]]
+        return {metric['dimensions'][resource_key]:
+                metric['dimensions'] for metric in metrics}
 
-            resource = self.t_cloudkitty.format_item(data, unit, resource_qty)
-            resource['desc']['resource_id'] = resource_id
-            resource['resource_id'] = resource_id
-            resource_data.append(resource)
-        return resource_data
+    def _format_data(self, metconf, data, resources_info=None):
+        """Formats Monasca data to CK data.
 
-    def retrieve(self, resource_type, start, end, project_id, q_filter=None):
-        resources = self.resource_info(resource_type, start, end,
-                                       project_id=project_id,
-                                       q_filter=q_filter)
-        if not resources:
-            raise collector.NoDataCollected(self.collector_name, resource_type)
-        return self.t_cloudkitty.format_service(resource_type, resources)
+        Returns metadata, groupby and qty
+
+        """
+        groupby = data['dimensions']
+
+        resource_key = metconf['extra_args']['resource_key']
+        metadata = dict()
+        if resources_info:
+            resource = resources_info[groupby[resource_key]]
+            for i in metconf['metadata']:
+                metadata[i] = resource.get(i, '')
+
+        qty = data['statistics'][0][1]
+        converted_qty = ck_utils.convert_unit(
+            qty, metconf['factor'], metconf['offset'])
+        mutated_qty = ck_utils.mutate(converted_qty, metconf['mutate'])
+        return metadata, groupby, mutated_qty
+
+    def fetch_all(self, metric_name, start, end,
+                  project_id=None, q_filter=None):
+        met = self.conf[metric_name]
+
+        data = self._fetch_measures(
+            metric_name,
+            start,
+            end,
+            project_id=project_id,
+            q_filter=q_filter,
+        )
+
+        resources_info = None
+        if met['metadata']:
+            resources_info = self._fetch_metrics(
+                metric_name,
+                start,
+                end,
+                project_id=project_id,
+                q_filter=q_filter,
+            )
+
+        formated_resources = list()
+        for d in data:
+            if len(d['statistics']):
+                metadata, groupby, qty = self._format_data(
+                    met, d, resources_info)
+                data = self.t_cloudkitty.format_item(
+                    groupby,
+                    metadata,
+                    met['unit'],
+                    qty=qty,
+                )
+                formated_resources.append(data)
+        return formated_resources

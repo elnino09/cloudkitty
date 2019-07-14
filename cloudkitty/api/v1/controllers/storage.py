@@ -18,6 +18,7 @@
 import datetime
 import decimal
 
+from oslo_config import cfg
 import pecan
 from pecan import rest
 from wsme import types as wtypes
@@ -25,8 +26,13 @@ import wsmeext.pecan as wsme_pecan
 
 from cloudkitty.api.v1.datamodels import storage as storage_models
 from cloudkitty.common import policy
-from cloudkitty import storage as ck_storage
+from cloudkitty import storage
 from cloudkitty import utils as ck_utils
+
+
+CONF = cfg.CONF
+
+CONF.import_opt('scope_key', 'cloudkitty.collector', 'collect')
 
 
 class DataFramesController(rest.RestController):
@@ -48,44 +54,54 @@ class DataFramesController(rest.RestController):
         :return: Collection of DataFrame objects.
         """
 
-        policy.enforce(pecan.request.context, 'storage:list_data_frames', {})
+        project_id = tenant_id or pecan.request.context.project_id
+        policy.authorize(pecan.request.context, 'storage:list_data_frames', {
+            'tenant_id': project_id,
+        })
 
-        if not begin:
-            begin = ck_utils.get_month_start()
-        if not end:
-            end = ck_utils.get_next_month()
-
-        begin_ts = ck_utils.dt2ts(begin)
-        end_ts = ck_utils.dt2ts(end)
+        scope_key = CONF.collect.scope_key
         backend = pecan.request.storage_backend
         dataframes = []
+        filters = {scope_key: tenant_id} if tenant_id else None
+
+        if begin:
+            begin = ck_utils.dt2ts(begin)
+        if end:
+            end = ck_utils.dt2ts(end)
         try:
-            frames = backend.get_time_frame(begin_ts,
-                                            end_ts,
-                                            tenant_id=tenant_id,
-                                            res_type=resource_type)
-            for frame in frames:
-                for service, data_list in frame['usage'].items():
-                    frame_tenant = None
-                    resources = []
-                    for data in data_list:
-                        desc = data['desc'] if data['desc'] else {}
-                        price = decimal.Decimal(str(data['rating']['price']))
-                        resource = storage_models.RatedResource(
-                            service=service,
-                            desc=desc,
-                            volume=data['vol']['qty'],
-                            rating=price)
-                        frame_tenant = data['tenant_id']
-                        resources.append(resource)
-                    dataframe = storage_models.DataFrame(
-                        begin=ck_utils.iso2dt(frame['period']['begin']),
-                        end=ck_utils.iso2dt(frame['period']['end']),
-                        tenant_id=frame_tenant,
-                        resources=resources)
-                    dataframes.append(dataframe)
-        except ck_storage.NoTimeFrame:
-            pass
+            resp = backend.retrieve(
+                begin, end,
+                filters=filters,
+                metric_types=resource_type,
+                paginate=False)
+        except storage.NoTimeFrame:
+            return storage_models.DataFrameCollection(dataframes=[])
+        for frame in resp['dataframes']:
+            for service, data_list in frame['usage'].items():
+                frame_tenant = None
+                resources = []
+                for data in data_list:
+                    # This means we use a v1 storage backend
+                    if 'desc' in data.keys():
+                        desc = data['desc']
+                    else:
+                        desc = data['metadata'].copy()
+                        desc.update(data.get('groupby', {}))
+                    price = decimal.Decimal(str(data['rating']['price']))
+                    resource = storage_models.RatedResource(
+                        service=service,
+                        desc=desc,
+                        volume=data['vol']['qty'],
+                        rating=price)
+                    if frame_tenant is None:
+                        frame_tenant = desc[scope_key]
+                    resources.append(resource)
+                dataframe = storage_models.DataFrame(
+                    begin=ck_utils.iso2dt(frame['period']['begin']),
+                    end=ck_utils.iso2dt(frame['period']['end']),
+                    tenant_id=frame_tenant,
+                    resources=resources)
+                dataframes.append(dataframe)
         return storage_models.DataFrameCollection(dataframes=dataframes)
 
 

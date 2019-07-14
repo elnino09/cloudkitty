@@ -84,6 +84,7 @@ class HashMapThresholdsController(rating.RatingRestControllerBase):
             service_uuid=service_id,
             field_uuid=field_id,
             group_uuid=group_id,
+            no_group=no_group,
             **search_opts)
         for threshold_uuid in thresholds_uuid_list:
             threshold_db = hashmap.get_threshold(uuid=threshold_uuid)
@@ -157,6 +158,8 @@ class HashMapThresholdsController(rating.RatingRestControllerBase):
                 group_id=threshold.group_id,
                 tenant_id=threshold.tenant_id)
             pecan.response.headers['Location'] = pecan.request.path
+        except db_api.ThresholdAlreadyExists as e:
+            pecan.abort(409, six.text_type(e))
         except db_api.NoSuchThreshold as e:
             pecan.abort(404, six.text_type(e))
         except db_api.ClientHashMapError as e:

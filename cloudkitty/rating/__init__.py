@@ -60,7 +60,7 @@ class RatingProcessorBase(object):
         :returns: bool if module is enabled
         """
         api = db_api.get_instance()
-        module_db = api.get_module_enable_state()
+        module_db = api.get_module_info()
         return module_db.get_state(self.module_name) or False
 
     @property
@@ -142,7 +142,7 @@ class RatingRestControllerBase(rest.RestController):
     @pecan.expose()
     def _route(self, args, request):
         try:
-            policy.enforce(request.context, 'rating:module_config', {})
+            policy.authorize(request.context, 'rating:module_config', {})
         except policy.PolicyNotAuthorized as e:
             pecan.abort(403, six.text_type(e))
 

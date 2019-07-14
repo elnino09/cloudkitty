@@ -4,7 +4,10 @@ Administration Guide
 
 .. toctree::
    :glob:
+   :maxdepth: 2
 
-   rating/introduction.rst
-   rating/hashmap.rst
-   rating/pyscripts.rst
+   architecture
+   devstack
+   install/index
+   configuration/index
+   cli/index

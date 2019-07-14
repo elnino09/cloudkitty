@@ -13,7 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-
 from cloudkitty.common import config as ck_config
 from cloudkitty import tests
 

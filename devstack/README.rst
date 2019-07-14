@@ -2,39 +2,54 @@
 Installing CloudKitty using DevStack
 ====================================
 
-The ``devstack`` directory contains the files necessary to integrate CloudKitty with DevStack.
+The ``devstack`` directory contains the required files to integrate CloudKitty
+with DevStack.
 
 Configure DevStack to run CloudKitty
+====================================
+
+.. code-block:: bash
 
     $ DEVSTACK_DIR=/path/to/devstack
 
-    1. enable Ceilometer::
+1. Enable Ceilometer:
 
-        $ cd ${DEVSTACK_DIR}
-        $ cat >> local.conf << EOF
-        [[local|localrc]]
-        # ceilometer
-        enable_plugin ceilometer https://git.openstack.org/openstack/ceilometer.git master
-        EOF
+   .. code-block:: bash
 
-    2. enable Gnocchi::
+      $ cd ${DEVSTACK_DIR}
+      $ cat >> local.conf << EOF
+      [[local|localrc]]
+      # ceilometer
+      enable_plugin ceilometer https://opendev.org/openstack/ceilometer.git master
+      EOF
 
-        $ cd ${DEVSTACK_DIR}
-        $ cat >> local.conf << EOF
-        # gnocchi
-        enable_plugin gnocchi https://github.com/gnocchixyz/gnocchi
-        enable_service gnocchi-api, gnocchi-metricd
-        EOF
+2. Enable CloudKitty:
 
-    3. enable CloudKitty::
+   .. code-block:: bash
 
-        $ cd ${DEVSTACK_DIR}
-        cat >> local.conf << EOF
-        # cloudkitty
-        enable_plugin cloudkitty https://git.openstack.org/openstack/cloudkitty master
-        enable_service ck-api, ck-proc
-        EOF
+      $ cd ${DEVSTACK_DIR}
+      cat >> local.conf << EOF
+      # cloudkitty
+      enable_plugin cloudkitty https://opendev.org/openstack/cloudkitty master
+      enable_service ck-api, ck-proc
+      EOF
 
-Run devstack as normal::
+3. Set CloudKitty collector to gnocchi:
 
-    $ ./stack.sh
+   .. code-block:: bash
+
+      $ cd ${DEVSTACK_DIR}
+      cat >> local.conf << EOF
+      CLOUDKITTY_COLLECTOR=gnocchi
+      EOF
+
+Run devstack as usual:
+
+.. code-block:: bash
+
+     $ ./stack.sh
+
+See the documentation_ if you want more details about how to configure the
+devstack plugin.
+
+.. _documentation: https://docs.openstack.org/cloudkitty/latest/devstack.html

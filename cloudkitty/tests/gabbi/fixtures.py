@@ -13,9 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-# @author: Stéphane Albert
-#
 import abc
+import datetime
 import decimal
 import os
 
@@ -41,8 +40,11 @@ from cloudkitty.db import api as ck_db_api
 from cloudkitty import messaging
 from cloudkitty import rating
 from cloudkitty import storage
-from cloudkitty.storage.sqlalchemy import models
+from cloudkitty.storage.v1.sqlalchemy import models
+from cloudkitty import storage_state
 from cloudkitty import tests
+from cloudkitty.tests.storage.v2 import influx_utils
+from cloudkitty.tests import utils as test_utils
 from cloudkitty import utils as ck_utils
 
 
@@ -189,7 +191,7 @@ class ConfigFixture(fixture.GabbiFixture):
         conf = conf_fixture.Config().conf
         policy_opts.set_defaults(conf)
         msg_conf = conffixture.ConfFixture(conf)
-        msg_conf.transport_driver = 'fake'
+        msg_conf.transport_url = 'fake:/'
         conf.import_group('api', 'cloudkitty.api.app')
         conf.set_override('auth_strategy', self.auth_strategy)
         conf.set_override('connection', 'sqlite:///', 'database')
@@ -202,6 +204,7 @@ class ConfigFixture(fixture.GabbiFixture):
                           )
         conf.import_group('storage', 'cloudkitty.storage')
         conf.set_override('backend', 'sqlalchemy', 'storage')
+        conf.set_override('version', '1', 'storage')
         self.conf = conf
         self.conn = ck_db_api.get_instance()
         migration = self.conn.get_migration()
@@ -211,6 +214,14 @@ class ConfigFixture(fixture.GabbiFixture):
         if self.conf:
             self.conf.reset()
         db.get_engine().dispose()
+
+
+class ConfigFixtureStorageV2(ConfigFixture):
+
+    def start_fixture(self):
+        super(ConfigFixtureStorageV2, self).start_fixture()
+        self.conf.set_override('backend', 'influxdb', 'storage')
+        self.conf.set_override('version', '2', 'storage')
 
 
 class ConfigFixtureKeystoneAuth(ConfigFixture):
@@ -272,17 +283,18 @@ class QuoteFakeRPC(BaseFakeRPC):
 
 
 class BaseStorageDataFixture(fixture.GabbiFixture):
-    def create_fake_data(self, begin, end):
+    def create_fake_data(self, begin, end, project_id):
         data = [{
             "period": {
                 "begin": begin,
                 "end": end},
             "usage": {
-                "compute": [
+                "cpu": [
                     {
                         "desc": {
                             "dummy": True,
-                            "fake_meta": 1.0},
+                            "fake_meta": 1.0,
+                            "project_id": project_id},
                         "vol": {
                             "qty": 1,
                             "unit": "nothing"},
@@ -292,11 +304,12 @@ class BaseStorageDataFixture(fixture.GabbiFixture):
                 "begin": begin,
                 "end": end},
             "usage": {
-                "image": [
+                "image.size": [
                     {
                         "desc": {
                             "dummy": True,
-                            "fake_meta": 1.0},
+                            "fake_meta": 1.0,
+                            "project_id": project_id},
                         "vol": {
                             "qty": 1,
                             "unit": "nothing"},
@@ -313,7 +326,7 @@ class BaseStorageDataFixture(fixture.GabbiFixture):
             return_value=dict())
         with auth:
             with session:
-                self.storage = storage.get_storage()
+                self.storage = storage.get_storage(conf=test_utils.load_conf())
         self.storage.init()
         self.initialize_data()
 
@@ -331,28 +344,19 @@ class StorageDataFixture(BaseStorageDataFixture):
         nodata_duration = (24 * 3 + 12) * 3600
         tenant_list = ['8f82cc70-e50c-466e-8624-24bdea811375',
                        '7606a24a-b8ad-4ae0-be6c-3d7a41334a2e']
-        for tenant in tenant_list:
-            for i in range(INITIAL_TIMESTAMP,
-                           INITIAL_TIMESTAMP + nodata_duration,
-                           3600):
-                self.storage.nodata(i, i + 3600, tenant)
         data_ts = INITIAL_TIMESTAMP + nodata_duration + 3600
         data_duration = (24 * 2 + 8) * 3600
         for i in range(data_ts,
                        data_ts + data_duration,
                        3600):
-            data = self.create_fake_data(i, i + 3600)
-            self.storage.append(data, tenant_list[0])
+            data = self.create_fake_data(i, i + 3600, tenant_list[0])
+            self.storage.push(data, tenant_list[0])
         half_duration = int(data_duration / 2)
         for i in range(data_ts,
                        data_ts + half_duration,
                        3600):
-            data = self.create_fake_data(i, i + 3600)
-            self.storage.append(data, tenant_list[1])
-        for i in range(data_ts + half_duration + 3600,
-                       data_ts + data_duration,
-                       3600):
-            self.storage.nodata(i, i + 3600, tenant_list[1])
+            data = self.create_fake_data(i, i + 3600, tenant_list[1])
+            self.storage.push(data, tenant_list[1])
 
 
 class NowStorageDataFixture(BaseStorageDataFixture):
@@ -361,9 +365,36 @@ class NowStorageDataFixture(BaseStorageDataFixture):
         for i in range(begin,
                        begin + 3600 * 12,
                        3600):
-            data = self.create_fake_data(i, i + 3600)
-            self.storage.append(data,
-                                '3d9a1b33-482f-42fd-aef9-b575a3da9369')
+            project_id = '3d9a1b33-482f-42fd-aef9-b575a3da9369'
+            data = self.create_fake_data(i, i + 3600, project_id)
+            self.storage.push(data, project_id)
+
+
+class ScopeStateFixture(fixture.GabbiFixture):
+
+    def start_fixture(self):
+        self.sm = storage_state.StateManager()
+        self.sm.init()
+        data = [
+            ('aaaa', datetime.datetime(2019, 1, 1), 'fet1', 'col1', 'key1'),
+            ('bbbb', datetime.datetime(2019, 2, 2), 'fet1', 'col1', 'key2'),
+            ('cccc', datetime.datetime(2019, 3, 3), 'fet1', 'col2', 'key1'),
+            ('dddd', datetime.datetime(2019, 4, 4), 'fet1', 'col2', 'key2'),
+            ('eeee', datetime.datetime(2019, 5, 5), 'fet2', 'col1', 'key1'),
+            ('ffff', datetime.datetime(2019, 6, 6), 'fet2', 'col1', 'key2'),
+            ('gggg', datetime.datetime(2019, 6, 6), 'fet2', 'col2', 'key1'),
+            ('hhhh', datetime.datetime(2019, 6, 6), 'fet2', 'col2', 'key2'),
+        ]
+        for d in data:
+            self.sm.set_state(
+                d[0], d[1], fetcher=d[2], collector=d[3], scope_key=d[4])
+
+    def stop_fixture(self):
+        session = db.get_session()
+        q = utils.model_query(
+            self.sm.model,
+            session)
+        q.delete()
 
 
 class CORSConfigFixture(fixture.GabbiFixture):
@@ -385,6 +416,46 @@ class CORSConfigFixture(fixture.GabbiFixture):
     def stop_fixture(self):
         """Remove the monkeypatch."""
         cfg.ConfigOpts.GroupAttr.__getattr__ = self._original_call_method
+
+
+class MetricsConfFixture(fixture.GabbiFixture):
+    """Inject Metrics configuration mock to the get_metrics_conf() function"""
+
+    def start_fixture(self):
+        self._original_function = ck_utils.load_conf
+        ck_utils.load_conf = mock.Mock(
+            return_value=tests.samples.METRICS_CONF,
+        )
+
+    def stop_fixture(self):
+        """Remove the get_metrics_conf() monkeypatch."""
+        ck_utils.load_conf = self._original_function
+
+
+class InfluxStorageDataFixture(NowStorageDataFixture):
+
+    def start_fixture(self):
+        cli = influx_utils.FakeInfluxClient()
+        st = storage.get_storage()
+        st._conn = cli
+
+        self._get_storage_patch = mock.patch(
+            'cloudkitty.storage.get_storage',
+            new=lambda **kw: st,
+        )
+        self._get_storage_patch.start()
+
+        super(InfluxStorageDataFixture, self).start_fixture()
+
+    def initialize_data(self):
+        data = test_utils.generate_v2_storage_data(
+            start=ck_utils.get_month_start(),
+            end=ck_utils.utcnow().replace(hour=0),
+        )
+        self.storage.push([data])
+
+    def stop_fixture(self):
+        self._get_storage_patch.stop()
 
 
 def setup_app():

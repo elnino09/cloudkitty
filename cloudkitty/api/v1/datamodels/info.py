@@ -18,33 +18,25 @@
 from oslo_config import cfg
 from wsme import types as wtypes
 
-from cloudkitty import utils as ck_utils
 
 CONF = cfg.CONF
 
-METRICS_CONF = ck_utils.get_metrics_conf(CONF.collect.metrics_conf)
 
-CLOUDKITTY_SERVICES = wtypes.Enum(wtypes.text,
-                                  *METRICS_CONF['services'])
+class CloudkittyMetricInfo(wtypes.Base):
+    """Type describing a metric info in CloudKitty."""
 
-
-class CloudkittyServiceInfo(wtypes.Base):
-    """Type describing a service info in CloudKitty.
-
-    """
-
-    service_id = CLOUDKITTY_SERVICES
-    """Name of the service."""
+    metric_id = wtypes.text
+    """Name of the metric."""
 
     metadata = [wtypes.text]
-    """List of service metadata"""
+    """List of metric metadata"""
 
     unit = wtypes.text
-    """service unit"""
+    """Metric unit"""
 
     def to_json(self):
         res_dict = {}
-        res_dict[self.service_id] = [{
+        res_dict[self.metric_id] = [{
             'metadata': self.metadata,
             'unit': self.unit
         }]
@@ -52,18 +44,19 @@ class CloudkittyServiceInfo(wtypes.Base):
 
     @classmethod
     def sample(cls):
-        sample = cls(service_id='compute',
-                     metadata=['resource_id', 'flavor', 'availability_zone'],
-                     unit='instance')
+        metadata = ['resource_id', 'project_id', 'qty', 'unit']
+        sample = cls(metric_id='image.size',
+                     metadata=metadata,
+                     unit='MiB')
         return sample
 
 
-class CloudkittyServiceInfoCollection(wtypes.Base):
-    """A list of CloudKittyServiceInfo."""
+class CloudkittyMetricInfoCollection(wtypes.Base):
+    """A list of CloudKittyMetricInfo."""
 
-    services = [CloudkittyServiceInfo]
+    metrics = [CloudkittyMetricInfo]
 
     @classmethod
     def sample(cls):
-        sample = CloudkittyServiceInfo.sample()
-        return cls(services=[sample])
+        sample = CloudkittyMetricInfo.sample()
+        return cls(metrics=[sample])

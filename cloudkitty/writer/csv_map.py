@@ -39,12 +39,11 @@ class CSVMapped(csv_base.BaseCSVBackend):
              ('UserId', 'desc:user_id'),
              ('ProjectId', 'desc:project_id'),
              ('ItemName', 'desc:name'),
-             ('ItemFlavor', 'desc:flavor'),
+             ('ItemFlavor', 'desc:flavor_name'),
+             ('ItemFlavorId', 'desc:flavor_id'),
              ('AvailabilityZone', 'desc:availability_zone'),
              ('Service', self._trans_service),
-             ('ItemDescription', 'rating:description'),
              ('UsageQuantity', 'vol:qty'),
-             ('RateId', 'rating:rate_id'),
              ('RateValue', 'rating:price'),
              ('Cost', self._trans_calc_cost),
              ('user:*', 'desc:metadata:*')])
@@ -95,7 +94,8 @@ class CSVMapped(csv_base.BaseCSVBackend):
         """Get the end usage of this period.
 
         """
-        if self.cached_start == self.usage_start and self.cached_end_str:
+        if self.cached_start == self.usage_start and self.cached_end_str \
+           and self.cached_end > self.cached_start:
             return self.cached_end_str
         else:
             usage_end = self.usage_start_dt + datetime.timedelta(
@@ -119,7 +119,7 @@ class CSVMapped(csv_base.BaseCSVBackend):
         """Context dependent product name translation.
 
         """
-        if context == 'compute':
+        if context == 'compute' or context == 'instance':
             return 'Nova Computing'
         else:
             return context
@@ -128,15 +128,14 @@ class CSVMapped(csv_base.BaseCSVBackend):
         """Context dependent operation translation.
 
         """
-        if context == 'compute':
+        if context == 'compute' or context == 'instance':
             return 'RunInstances'
 
     def _trans_res_id(self, context, report_data):
         """Context dependent resource id transformation function.
 
         """
-        if context == 'compute':
-            return report_data['desc'].get('instance_id')
+        return report_data['desc'].get('resource_id')
 
     def _trans_calc_cost(self, context, report_data):
         """Cost calculation function.
